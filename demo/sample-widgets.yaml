@@ -1,0 +1,26 @@
+apiVersion: demo.example.com/v1
+kind: Widget
+metadata:
+  name: test-widget-1
+  namespace: default
+spec:
+  name: first
+  baz: this-should-survive
+---
+apiVersion: demo.example.com/v1
+kind: Widget
+metadata:
+  name: test-widget-2
+  namespace: default
+spec:
+  name: second
+  baz: so-should-this
+---
+apiVersion: demo.example.com/v1
+kind: Widget
+metadata:
+  name: test-widget-3
+  namespace: default
+spec:
+  name: third
+  baz: and-this

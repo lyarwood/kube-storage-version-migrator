@@ -17,6 +17,14 @@
 #   6. Switches storage to v1beta1 (no "bar" in schema)
 #   7. Runs the migrator
 #   8. Snapshots raw etcd data again and diffs against the before snapshot
+#
+# Part 2 — v1 field removal (no storage version change):
+#   9. Installs a single-version v1 CRD (Widget) with field "baz"
+#  10. Creates sample Widget objects with "baz" set
+#  11. Updates the CRD schema to remove "baz"
+#  12. Shows that existing objects in etcd still have "baz"
+#  13. Performs a no-op write on one object to trigger pruning
+#  14. Diffs etcd to show only the written object lost "baz"
 
 set -o errexit
 set -o nounset
@@ -218,8 +226,107 @@ for before_file in "${DIFF_DIR}/before/"*.json; do
 done
 
 info ""
-info "Demo complete. The 'bar' field has been pruned from etcd by the"
+info "Part 1 complete. The 'bar' field has been pruned from etcd by the"
 info "storage version migration. The API server's schema pruning removed"
 info "the field during the migrator's no-op PUT through the v1beta1 endpoint."
+
+# ==========================================================================
+# Part 2: v1 field removal — no storage version change
+# ==========================================================================
+
+info ""
+info "=========================================="
+info "  Part 2: v1 field removal (no migration)"
+info "=========================================="
+info ""
+
+# -- step 9: install single-version v1 CRD with baz --
+
+info "Installing Widget CRD (v1 only, has field 'baz')..."
+kubectl apply -f "${DEMO_DIR}/crd-v1-with-baz.yaml"
+kubectl wait --for=condition=Established crd widgets.demo.example.com --timeout=30s
+
+# -- step 10: create sample Widget objects --
+
+info "Creating sample Widget objects with 'baz' field set..."
+kubectl apply -f "${DEMO_DIR}/sample-widgets.yaml"
+
+# -- step 11: snapshot etcd (before schema change) --
+
+info "Snapshotting Widget etcd data (before schema change)..."
+WIDGET_ETCD_PREFIX="/registry/demo.example.com/widgets/default"
+mkdir -p "${DIFF_DIR}/v1-before" "${DIFF_DIR}/v1-after"
+for key in $(etcdctl_get_prefix "${WIDGET_ETCD_PREFIX}" | grep -v '^$'); do
+  name=$(basename "$key")
+  dump_etcd_json "$key" "${DIFF_DIR}/v1-before/${name}.json"
+  info "  captured ${name}"
+done
+
+# -- step 12: remove baz from the v1 schema --
+
+info "Updating Widget CRD to remove 'baz' from v1 schema..."
+kubectl apply -f "${DEMO_DIR}/crd-v1-without-baz.yaml"
+sleep 2
+
+# -- step 13: confirm etcd is unchanged --
+
+info "Checking etcd after schema change (no writes have occurred)..."
+for key in $(etcdctl_get_prefix "${WIDGET_ETCD_PREFIX}" | grep -v '^$'); do
+  name=$(basename "$key")
+  dump_etcd_json "$key" "${DIFF_DIR}/v1-after/${name}.json"
+done
+
+SCHEMA_CHANGE_HAS_DIFF=false
+for before_file in "${DIFF_DIR}/v1-before/"*.json; do
+  name=$(basename "$before_file")
+  if ! diff -q "$before_file" "${DIFF_DIR}/v1-after/${name}" >/dev/null 2>&1; then
+    SCHEMA_CHANGE_HAS_DIFF=true
+  fi
+done
+if [ "$SCHEMA_CHANGE_HAS_DIFF" = false ]; then
+  info "  etcd is UNCHANGED — removing a field from the schema alone does not rewrite objects"
+else
+  info "  WARNING: unexpected diff detected after schema change"
+fi
+
+# -- step 14: no-op write on one object to trigger pruning --
+
+info "Performing a no-op write on test-widget-1 (GET then PUT, same as the migrator)..."
+kubectl get widget test-widget-1 -o json | kubectl replace -f - 2>&1
+
+info "Snapshotting Widget etcd data (after no-op write on test-widget-1 only)..."
+for key in $(etcdctl_get_prefix "${WIDGET_ETCD_PREFIX}" | grep -v '^$'); do
+  name=$(basename "$key")
+  dump_etcd_json "$key" "${DIFF_DIR}/v1-after/${name}.json"
+done
+
+info ""
+info "=========================================="
+info "  etcd diff (v1 schema change + one write)"
+info "=========================================="
+info ""
+
+for before_file in "${DIFF_DIR}/v1-before/"*.json; do
+  name=$(basename "$before_file")
+  after_file="${DIFF_DIR}/v1-after/${name}"
+  echo "--- ${name} ---"
+  if diff -q "$before_file" "$after_file" >/dev/null 2>&1; then
+    echo "(no changes — object was not rewritten)"
+  else
+    diff --unified --color=always "$before_file" "$after_file" || true
+  fi
+  echo ""
+done
+
+info ""
+info "Demo complete."
+info ""
+info "Part 1 showed that the storage version migrator prunes removed fields"
+info "from etcd by rewriting every object through the API server."
+info ""
+info "Part 2 showed that removing a field from a single-version v1 CRD does"
+info "NOT affect existing objects in etcd. The field is only pruned when an"
+info "object is next written (by a controller, user, or the migrator). Objects"
+info "that are never rewritten retain the old field in etcd indefinitely."
 
 # cleanup via trap
