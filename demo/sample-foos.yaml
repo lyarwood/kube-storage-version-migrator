@@ -1,0 +1,26 @@
+apiVersion: demo.example.com/v1alpha1
+kind: Foo
+metadata:
+  name: test-foo-1
+  namespace: default
+spec:
+  name: first
+  bar: this-should-be-dropped
+---
+apiVersion: demo.example.com/v1alpha1
+kind: Foo
+metadata:
+  name: test-foo-2
+  namespace: default
+spec:
+  name: second
+  bar: this-too
+---
+apiVersion: demo.example.com/v1alpha1
+kind: Foo
+metadata:
+  name: test-foo-3
+  namespace: default
+spec:
+  name: third
+  bar: and-this
