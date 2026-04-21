@@ -25,6 +25,13 @@
 #  12. Shows that existing objects in etcd still have "baz"
 #  13. Performs a no-op write on one object to trigger pruning
 #  14. Diffs etcd to show only the written object lost "baz"
+#
+# Part 3 — skip-level upgrade (N → N+5):
+#  15. Installs a Gadget CRD at "version N" with v1alpha1 and four fields
+#  16. Creates sample Gadget objects with all fields populated
+#  17. Simulates a skip-level upgrade to "version N+5" (v1 as storage)
+#  18. Runs the migrator — all fields removed across N+2..N+4 are pruned at once
+#  19. Diffs etcd to show the compounded data loss
 
 set -o errexit
 set -o nounset
@@ -319,6 +326,92 @@ for before_file in "${DIFF_DIR}/v1-before/"*.json; do
 done
 
 info ""
+info "Part 2 complete. Removing a field from a v1 schema does not rewrite"
+info "objects — the field lingers in etcd until the next write."
+
+# ==========================================================================
+# Part 3: skip-level upgrade — compounded field loss
+# ==========================================================================
+
+info ""
+info "=========================================="
+info "  Part 3: skip-level upgrade (N → N+5)"
+info "=========================================="
+info ""
+info "Scenario: a Gadget CRD evolves across cluster versions:"
+info "  N   — v1alpha1 introduced: name, debugMode, legacyPort, internalRef"
+info "  N+2 — v1beta1 added, debugMode removed (was experimental)"
+info "  N+3 — legacyPort removed from v1beta1 (replaced by a Service)"
+info "  N+4 — v1 added, internalRef removed (moved to status)"
+info "  N+5 — v1 becomes storage"
+info ""
+info "A user upgrades directly from N to N+5, skipping N+1 through N+4."
+info ""
+
+# -- step 15: install Gadget CRD at "version N" --
+
+info "Installing Gadget CRD at 'version N' (v1alpha1 only, all fields)..."
+kubectl apply -f "${DEMO_DIR}/crd-gadget-vN.yaml"
+kubectl wait --for=condition=Established crd gadgets.demo.example.com --timeout=30s
+
+# -- step 16: create sample Gadget objects --
+
+info "Creating sample Gadget objects with all four fields populated..."
+kubectl apply -f "${DEMO_DIR}/sample-gadgets.yaml"
+
+info "Snapshotting Gadget etcd data (version N, before upgrade)..."
+GADGET_ETCD_PREFIX="/registry/demo.example.com/gadgets/default"
+mkdir -p "${DIFF_DIR}/skip-before" "${DIFF_DIR}/skip-after"
+for key in $(etcdctl_get_prefix "${GADGET_ETCD_PREFIX}" | grep -v '^$'); do
+  name=$(basename "$key")
+  dump_etcd_json "$key" "${DIFF_DIR}/skip-before/${name}.json"
+  info "  captured ${name}"
+done
+
+# -- step 17: simulate skip-level upgrade to N+5 --
+
+info "Simulating skip-level upgrade: applying 'version N+5' CRD..."
+info "  (v1alpha1, v1beta1, v1 all served — v1 is now storage)"
+kubectl apply -f "${DEMO_DIR}/crd-gadget-vN5.yaml"
+sleep 2
+
+# -- step 18: run the migrator --
+
+info "Creating StorageVersionMigration for gadgets → v1..."
+kubectl apply -f "${DEMO_DIR}/migration-gadgets.yaml"
+
+info "Starting migrator..."
+timeout 60 "${DEMO_DIR}/migrator" --kubeconfig "${KUBECONFIG_PATH}" &
+MIGRATOR_PID=$!
+sleep 3
+wait_for_migration "demo-gadget-migration"
+kill $MIGRATOR_PID 2>/dev/null || true
+wait $MIGRATOR_PID 2>/dev/null || true
+
+# -- step 19: snapshot and diff --
+
+info "Snapshotting Gadget etcd data (after skip-level migration)..."
+for key in $(etcdctl_get_prefix "${GADGET_ETCD_PREFIX}" | grep -v '^$'); do
+  name=$(basename "$key")
+  dump_etcd_json "$key" "${DIFF_DIR}/skip-after/${name}.json"
+  info "  captured ${name}"
+done
+
+info ""
+info "=========================================="
+info "  etcd diff (skip-level N → N+5)"
+info "=========================================="
+info ""
+
+for before_file in "${DIFF_DIR}/skip-before/"*.json; do
+  name=$(basename "$before_file")
+  after_file="${DIFF_DIR}/skip-after/${name}"
+  echo "--- ${name} ---"
+  diff --unified --color=always "$before_file" "$after_file" || true
+  echo ""
+done
+
+info ""
 info "Demo complete."
 info ""
 info "Part 1 showed that the storage version migrator prunes removed fields"
@@ -328,5 +421,11 @@ info "Part 2 showed that removing a field from a single-version v1 CRD does"
 info "NOT affect existing objects in etcd. The field is only pruned when an"
 info "object is next written (by a controller, user, or the migrator). Objects"
 info "that are never rewritten retain the old field in etcd indefinitely."
+info ""
+info "Part 3 showed that a skip-level upgrade compounds all intermediate field"
+info "removals into a single migration. Fields removed across N+2, N+3, and N+4"
+info "are all pruned at once when migrating from v1alpha1 to v1 — there is no"
+info "opportunity to recover data that would have been preserved in a step-by-step"
+info "upgrade path."
 
 # cleanup via trap

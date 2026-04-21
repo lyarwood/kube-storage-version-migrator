@@ -1,0 +1,21 @@
+apiVersion: demo.example.com/v1alpha1
+kind: Gadget
+metadata:
+  name: test-gadget-1
+  namespace: default
+spec:
+  name: sensor
+  debugMode: true
+  legacyPort: 8080
+  internalRef: "ns/configmap-abc"
+---
+apiVersion: demo.example.com/v1alpha1
+kind: Gadget
+metadata:
+  name: test-gadget-2
+  namespace: default
+spec:
+  name: actuator
+  debugMode: false
+  legacyPort: 9090
+  internalRef: "ns/configmap-def"
