@@ -1,0 +1,17 @@
+apiVersion: demo.example.com/v1alpha1
+kind: Converter
+metadata:
+  name: test-converter-1
+  namespace: default
+spec:
+  name: webserver
+  legacyPort: 8080
+---
+apiVersion: demo.example.com/v1alpha1
+kind: Converter
+metadata:
+  name: test-converter-2
+  namespace: default
+spec:
+  name: api-gateway
+  legacyPort: 9090

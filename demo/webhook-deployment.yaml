@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: converter-webhook
+  namespace: default
+  labels:
+    app: converter-webhook
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: converter-webhook
+  template:
+    metadata:
+      labels:
+        app: converter-webhook
+    spec:
+      containers:
+      - name: webhook
+        image: localhost/converter-webhook:demo
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8443
+        args:
+        - --tls-cert=/tls/tls.crt
+        - --tls-key=/tls/tls.key
+        volumeMounts:
+        - name: tls
+          mountPath: /tls
+          readOnly: true
+      volumes:
+      - name: tls
+        secret:
+          secretName: converter-webhook-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: converter-webhook
+  namespace: default
+spec:
+  selector:
+    app: converter-webhook
+  ports:
+  - port: 443
+    targetPort: 8443
+    protocol: TCP

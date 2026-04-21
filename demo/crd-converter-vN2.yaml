@@ -1,0 +1,57 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: converters.demo.example.com
+spec:
+  group: demo.example.com
+  names:
+    kind: Converter
+    listKind: ConverterList
+    plural: converters
+    singular: converter
+  scope: Namespaced
+  conversion:
+    strategy: Webhook
+    webhook:
+      clientConfig:
+        service:
+          namespace: default
+          name: converter-webhook
+          path: /convert
+          port: 443
+        caBundle: __CA_BUNDLE__
+      conversionReviewVersions: ["v1"]
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: false
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              name:
+                type: string
+              legacyPort:
+                type: integer
+  - name: v1beta1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              name:
+                type: string
+              portConfig:
+                type: object
+                properties:
+                  port:
+                    type: integer
+                  protocol:
+                    type: string

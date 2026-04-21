@@ -132,9 +132,17 @@ cleanup() {
 
 # -- preflight --
 
-for cmd in kind kubectl go python3; do
+for cmd in kind kubectl go python3 openssl; do
   command -v "$cmd" >/dev/null 2>&1 || error "'$cmd' is required but not found"
 done
+
+if command -v podman >/dev/null 2>&1; then
+  CONTAINER_RUNTIME=podman
+elif command -v docker >/dev/null 2>&1; then
+  CONTAINER_RUNTIME=docker
+else
+  error "podman or docker is required"
+fi
 
 trap cleanup EXIT
 
@@ -326,8 +334,7 @@ for before_file in "${DIFF_DIR}/v1-before/"*.json; do
 done
 
 info ""
-info "Part 2 complete. Removing a field from a v1 schema does not rewrite"
-info "objects — the field lingers in etcd until the next write."
+info "Part 2 complete."
 
 # ==========================================================================
 # Part 3: skip-level upgrade — compounded field loss
@@ -412,20 +419,220 @@ for before_file in "${DIFF_DIR}/skip-before/"*.json; do
 done
 
 info ""
+info "Part 3 complete."
+
+# ==========================================================================
+# Part 4: Conversion webhooks — skip-level data loss
+# ==========================================================================
+
+info ""
+info "=========================================="
+info "  Part 4: Conversion webhooks"
+info "=========================================="
+info ""
+info "A Converter CRD evolves across cluster versions:"
+info "  N   — v1alpha1: spec.legacyPort (integer)"
+info "  N+2 — v1beta1 added with webhook converting legacyPort → portConfig"
+info "  N+5 — v1 added, webhook removed, None conversion"
+info ""
+
+# -- step 20: generate TLS certs for webhook --
+
+info "Generating TLS certificates for webhook..."
+CERT_DIR="${DIFF_DIR}/certs"
+mkdir -p "${CERT_DIR}"
+
+openssl req -x509 -newkey rsa:2048 \
+  -keyout "${CERT_DIR}/ca.key" -out "${CERT_DIR}/ca.crt" \
+  -days 1 -nodes -subj "/CN=converter-webhook-ca" 2>/dev/null
+
+openssl req -newkey rsa:2048 \
+  -keyout "${CERT_DIR}/tls.key" -out "${CERT_DIR}/tls.csr" \
+  -nodes -subj "/CN=converter-webhook.default.svc" \
+  -addext "subjectAltName=DNS:converter-webhook.default.svc,DNS:converter-webhook.default.svc.cluster.local" 2>/dev/null
+
+openssl x509 -req -in "${CERT_DIR}/tls.csr" \
+  -CA "${CERT_DIR}/ca.crt" -CAkey "${CERT_DIR}/ca.key" -CAcreateserial \
+  -out "${CERT_DIR}/tls.crt" -days 1 \
+  -extfile <(echo "subjectAltName=DNS:converter-webhook.default.svc,DNS:converter-webhook.default.svc.cluster.local") 2>/dev/null
+
+# -- step 21: build and load webhook image --
+
+info "Building webhook container image..."
+${CONTAINER_RUNTIME} build -t localhost/converter-webhook:demo "${DEMO_DIR}/webhook/" 2>&1 | tail -1
+
+info "Loading image into kind cluster..."
+if [ "${CONTAINER_RUNTIME}" = "podman" ]; then
+  ${CONTAINER_RUNTIME} save localhost/converter-webhook:demo -o "${DIFF_DIR}/converter-webhook.tar"
+  kind load image-archive "${DIFF_DIR}/converter-webhook.tar" --name "${CLUSTER_NAME}" 2>&1 | grep -v "^$"
+  rm -f "${DIFF_DIR}/converter-webhook.tar"
+else
+  kind load docker-image localhost/converter-webhook:demo --name "${CLUSTER_NAME}" 2>&1 | grep -v "^$"
+fi
+
+# -- step 22: deploy webhook --
+
+info "Creating TLS secret and deploying webhook..."
+kubectl create secret tls converter-webhook-tls \
+  --cert="${CERT_DIR}/tls.crt" --key="${CERT_DIR}/tls.key" 2>&1
+
+kubectl apply -f "${DEMO_DIR}/webhook-deployment.yaml" 2>&1
+kubectl wait --for=condition=Available deployment/converter-webhook --timeout=60s 2>&1
+
+# =====================================================
+# Phase A: Incremental upgrade N → N+2 (data preserved)
+# =====================================================
+
+info ""
+info "--- Phase A: incremental upgrade N → N+2 (with webhook) ---"
+info ""
+
+# -- install CRD at N, create objects --
+
+info "Installing Converter CRD at 'version N' (v1alpha1 only)..."
+kubectl apply -f "${DEMO_DIR}/crd-converter-vN.yaml" 2>&1
+kubectl wait --for=condition=Established crd converters.demo.example.com --timeout=30s 2>&1
+
+info "Creating sample Converter objects with legacyPort..."
+kubectl apply -f "${DEMO_DIR}/sample-converters.yaml" 2>&1
+
+info "Snapshotting etcd (version N, before incremental upgrade)..."
+CONVERTER_ETCD_PREFIX="/registry/demo.example.com/converters/default"
+mkdir -p "${DIFF_DIR}/webhook-incremental-before" "${DIFF_DIR}/webhook-incremental-after"
+for key in $(etcdctl_get_prefix "${CONVERTER_ETCD_PREFIX}" | grep -v '^$'); do
+  name=$(basename "$key")
+  dump_etcd_json "$key" "${DIFF_DIR}/webhook-incremental-before/${name}.json"
+  info "  captured ${name}"
+done
+
+# -- upgrade to N+2 with webhook conversion --
+
+info "Upgrading to 'version N+2' (v1beta1 storage, webhook conversion)..."
+CA_BUNDLE=$(base64 -w0 "${CERT_DIR}/ca.crt")
+sed "s|__CA_BUNDLE__|${CA_BUNDLE}|" "${DEMO_DIR}/crd-converter-vN2.yaml" | kubectl apply -f - 2>&1
+sleep 2
+
+# -- run migration to v1beta1 --
+
+info "Creating StorageVersionMigration for converters → v1beta1..."
+kubectl apply -f "${DEMO_DIR}/migration-converters-v1beta1.yaml" 2>&1
+
+info "Starting migrator..."
+timeout 60 "${DEMO_DIR}/migrator" --kubeconfig "${KUBECONFIG_PATH}" > /dev/null 2>&1 &
+MIGRATOR_PID=$!
+sleep 5
+wait_for_migration "demo-converter-migration-v1beta1"
+kill $MIGRATOR_PID 2>/dev/null || true
+wait $MIGRATOR_PID 2>/dev/null || true
+
+# -- snapshot and diff --
+
+info "Snapshotting etcd (after incremental migration with webhook)..."
+for key in $(etcdctl_get_prefix "${CONVERTER_ETCD_PREFIX}" | grep -v '^$'); do
+  name=$(basename "$key")
+  dump_etcd_json "$key" "${DIFF_DIR}/webhook-incremental-after/${name}.json"
+  info "  captured ${name}"
+done
+
+info ""
+info "=========================================="
+info "  Phase A diff: incremental N → N+2"
+info "=========================================="
+info ""
+
+for before_file in "${DIFF_DIR}/webhook-incremental-before/"*.json; do
+  name=$(basename "$before_file")
+  after_file="${DIFF_DIR}/webhook-incremental-after/${name}"
+  echo "--- ${name} ---"
+  diff --unified --color=always "$before_file" "$after_file" || true
+  echo ""
+done
+
+# =====================================================
+# Phase B: Skip-level upgrade N → N+5 (data lost)
+# =====================================================
+
+info ""
+info "--- Phase B: skip-level upgrade N → N+5 (without webhook) ---"
+info ""
+
+# -- clean up Phase A --
+
+info "Resetting: deleting converter objects and migration CR..."
+kubectl delete converters --all 2>&1
+kubectl delete storageversionmigration demo-converter-migration-v1beta1 2>&1
+
+info "Reverting CRD to 'version N'..."
+kubectl patch crd converters.demo.example.com --type=json --subresource=status \
+  -p '[{"op":"replace","path":"/status/storedVersions","value":["v1alpha1"]}]' 2>&1
+kubectl apply -f "${DEMO_DIR}/crd-converter-vN.yaml" 2>&1
+sleep 2
+
+info "Recreating sample objects at v1alpha1..."
+kubectl apply -f "${DEMO_DIR}/sample-converters.yaml" 2>&1
+
+info "Snapshotting etcd (version N, before skip-level upgrade)..."
+mkdir -p "${DIFF_DIR}/webhook-skip-before" "${DIFF_DIR}/webhook-skip-after"
+for key in $(etcdctl_get_prefix "${CONVERTER_ETCD_PREFIX}" | grep -v '^$'); do
+  name=$(basename "$key")
+  dump_etcd_json "$key" "${DIFF_DIR}/webhook-skip-before/${name}.json"
+  info "  captured ${name}"
+done
+
+# -- remove webhook and skip to N+5 --
+
+info "Removing webhook (simulating skip-level — webhook no longer ships)..."
+kubectl delete deployment converter-webhook 2>&1
+kubectl delete service converter-webhook 2>&1
+
+info "Skipping to 'version N+5' (v1 storage, None conversion, no webhook)..."
+kubectl apply -f "${DEMO_DIR}/crd-converter-vN5.yaml" 2>&1
+sleep 2
+
+# -- run migration to v1 --
+
+info "Creating StorageVersionMigration for converters → v1..."
+kubectl apply -f "${DEMO_DIR}/migration-converters-v1.yaml" 2>&1
+
+info "Starting migrator..."
+timeout 60 "${DEMO_DIR}/migrator" --kubeconfig "${KUBECONFIG_PATH}" > /dev/null 2>&1 &
+MIGRATOR_PID=$!
+sleep 5
+wait_for_migration "demo-converter-migration-v1"
+kill $MIGRATOR_PID 2>/dev/null || true
+wait $MIGRATOR_PID 2>/dev/null || true
+
+# -- snapshot and diff --
+
+info "Snapshotting etcd (after skip-level migration without webhook)..."
+for key in $(etcdctl_get_prefix "${CONVERTER_ETCD_PREFIX}" | grep -v '^$'); do
+  name=$(basename "$key")
+  dump_etcd_json "$key" "${DIFF_DIR}/webhook-skip-after/${name}.json"
+  info "  captured ${name}"
+done
+
+info ""
+info "=========================================="
+info "  Phase B diff: skip-level N → N+5"
+info "=========================================="
+info ""
+
+for before_file in "${DIFF_DIR}/webhook-skip-before/"*.json; do
+  name=$(basename "$before_file")
+  after_file="${DIFF_DIR}/webhook-skip-after/${name}"
+  echo "--- ${name} ---"
+  diff --unified --color=always "$before_file" "$after_file" || true
+  echo ""
+done
+
+info ""
 info "Demo complete."
 info ""
-info "Part 1 showed that the storage version migrator prunes removed fields"
-info "from etcd by rewriting every object through the API server."
-info ""
-info "Part 2 showed that removing a field from a single-version v1 CRD does"
-info "NOT affect existing objects in etcd. The field is only pruned when an"
-info "object is next written (by a controller, user, or the migrator). Objects"
-info "that are never rewritten retain the old field in etcd indefinitely."
-info ""
-info "Part 3 showed that a skip-level upgrade compounds all intermediate field"
-info "removals into a single migration. Fields removed across N+2, N+3, and N+4"
-info "are all pruned at once when migrating from v1alpha1 to v1 — there is no"
-info "opportunity to recover data that would have been preserved in a step-by-step"
-info "upgrade path."
+info "Part 1: storage version migration prunes removed fields from etcd."
+info "Part 2: v1 field removal does not rewrite objects — data lingers in etcd."
+info "Part 3: skip-level upgrades compound all intermediate field removals."
+info "Part 4: conversion webhooks can preserve data during incremental upgrades"
+info "  but skip-level upgrades bypass the webhook entirely — data is lost"
+info "  instead of being converted."
 
 # cleanup via trap
