@@ -50,11 +50,13 @@ conversion only ran when virt-controller processed a VM referencing those
 revisions. It was never wired as a Kubernetes conversion webhook.
 
 **Skip-level risk:** A user upgrading from v1.4.0 (v1alpha1 as storage)
-directly to v1.7.0+ would find that v1alpha1 is no longer served by the CRD.
-Any objects still stored in v1alpha1 encoding in etcd would become
-inaccessible — the API server cannot serve a version that is no longer in the
-CRD spec. This is worse than pruning: the data isn't lost from etcd, but it
-cannot be read or written through the API.
+directly to v1.7.0+ would find that v1alpha1 is no longer in the CRD spec.
+As demonstrated in Part 4, the API server still serves these objects — it reads
+the raw v1alpha1 bytes from etcd, swaps the `apiVersion` to v1beta1, and
+applies schema pruning. Any fields that exist in v1alpha1 but not in v1beta1
+are silently pruned on read. When the storage version migration runs and
+rewrites these objects through the v1beta1 endpoint, those fields are
+permanently lost from etcd.
 
 **Mitigation:** KubeVirt's upgrade handler (`pkg/instancetype/upgrade/handler.go`)
 upgrades ControllerRevisions to v1beta1 at runtime, so VMs that have been
@@ -146,11 +148,12 @@ Versions: []extv1.CustomResourceDefinitionVersion{
 Both versions are still served. The clone CRD notably has **no `Conversion`
 field at all** — not even an explicit `NoneConverter`.
 
-**When v1alpha1 is eventually removed:** Any clone objects still stored as
-v1alpha1 in etcd become inaccessible, as with the instancetype case. A storage
-version migration should be run before the version is dropped, but since there
-is no conversion webhook, any fields present in v1alpha1 but absent from
-v1beta1 would be pruned rather than converted.
+**When v1alpha1 is eventually removed:** As with the instancetype case, clone
+objects still stored as v1alpha1 in etcd would continue to be served through
+the v1beta1 endpoint with schema pruning applied. Any fields present in
+v1alpha1 but absent from v1beta1 would be pruned on read, and permanently lost
+when the storage version migration rewrites them. Since there is no conversion
+webhook, fields cannot be transformed — only dropped.
 
 ## The Application-Level Conversion Pattern
 
