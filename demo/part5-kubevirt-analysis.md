@@ -1,9 +1,23 @@
-# Part 5: KubeVirt — Real-World Skip-Level Upgrade Risks
+# Part 5: KubeVirt Skip-Level Upgrade Risk Analysis
 
-Parts 1–4 demonstrated field pruning mechanics using synthetic CRDs. This part
-applies the same analysis to the [KubeVirt](https://kubevirt.io/) project,
-examining its last five releases (v1.4.0 – v1.8.0) for risks that match the
-patterns shown earlier.
+## Context
+
+[VIRTSTRAT-627](https://redhat.atlassian.net/browse/VIRTSTRAT-627) tracks
+EUS-to-EUS upgrade support from OCP 4.22/4.23 to OCP 5.2. This is an N+3
+skip-level upgrade for the KubeVirt operator:
+
+| OCP | KubeVirt | Role |
+|---|---|---|
+| 4.22 | 1.8 | Starting EUS release |
+| 4.23 / 5.0 | 1.9 | Skipped (bridge release) |
+| 5.1 | 1.10 | Skipped |
+| 5.2 | 1.11 | Target EUS release |
+
+Parts 1–4 of this demo showed that storage version migration prunes fields
+removed from CRD schemas, and that conversion webhooks are the only mechanism
+to transform (rather than drop) fields during migration. This part applies
+those findings to KubeVirt, examining what happens to CRD data during the
+1.8 → 1.11 jump.
 
 ## KubeVirt Does Not Use Conversion Webhooks
 
@@ -16,59 +30,26 @@ Conversion: &extv1.CustomResourceConversion{
 },
 ```
 
-This appears 10 times — for VirtualMachineSnapshot, VirtualMachineSnapshotContent,
-VirtualMachineRestore, VirtualMachineInstancetype, VirtualMachineClusterInstancetype,
-VirtualMachinePreference, VirtualMachineClusterPreference, and the export CRDs.
-
-The VirtualMachineClone CRD omits the `Conversion` field entirely (defaulting
-to None).
+This appears 10 times across all multi-version CRDs (snapshot,
+snapshotcontent, restore, instancetype, clusterinstancetype, preference,
+clusterpreference, export). The clone CRD omits the `Conversion` field
+entirely, defaulting to None.
 
 This means KubeVirt is exposed to a **variant of the Part 4 scenario**: there
-is no webhook to bypass during a skip-level upgrade because **there was never a
-webhook to begin with**. Field restructuring relies on application-level Go
-code in virt-controller rather than Kubernetes conversion webhooks. That code
-runs when virt-controller processes objects at runtime — not during storage
-version migration. So the migrator can only prune fields, never convert them.
+is no webhook to bypass during a skip-level upgrade because there was never a
+webhook to begin with. Field restructuring relies entirely on
+application-level Go code in virt-controller, which only runs when
+virt-controller reconciles objects at runtime — not during storage version
+migration.
 
-## Risks Identified Across v1.4.0 – v1.8.0
+## Risks Already Present in KubeVirt 1.8
 
-### 1. Instancetype API v1alpha1/v1alpha2 Removal
+These risks exist today and will compound across the 1.8 → 1.11 jump if
+the deprecated fields are removed in any of the intermediate releases.
 
-**Versions affected:** v1.6.0 (stopped serving), v1.7.0 (fully removed)
+### PreferredUseEfi / PreferredUseSecureBoot → PreferredEfi
 
-| Release | Change |
-|---|---|
-| v1.6.0 | v1alpha1 and v1alpha2 stopped being served (`Served: false`) |
-| v1.7.0 | v1alpha1 and v1alpha2 removed from the CRD entirely |
-
-Today only v1beta1 exists in the instancetype CRD.
-
-**Application-level conversion existed** — Go functions in
-`pkg/instancetype/compatibility/` could decode v1alpha1/v1alpha2
-ControllerRevisions and convert them to v1beta1 at runtime. But this
-conversion only ran when virt-controller processed a VM referencing those
-revisions. It was never wired as a Kubernetes conversion webhook.
-
-**Skip-level risk:** A user upgrading from v1.4.0 (v1alpha1 as storage)
-directly to v1.7.0+ would find that v1alpha1 is no longer in the CRD spec.
-As demonstrated in Part 4, the API server still serves these objects — it reads
-the raw v1alpha1 bytes from etcd, swaps the `apiVersion` to v1beta1, and
-applies schema pruning. Any fields that exist in v1alpha1 but not in v1beta1
-are silently pruned on read. When the storage version migration runs and
-rewrites these objects through the v1beta1 endpoint, those fields are
-permanently lost from etcd.
-
-**Mitigation:** KubeVirt's upgrade handler (`pkg/instancetype/upgrade/handler.go`)
-upgrades ControllerRevisions to v1beta1 at runtime, so VMs that have been
-reconciled by virt-controller before the upgrade would already have their
-revisions converted. The risk is for objects that were never reconciled.
-
-### 2. PreferredUseEfi / PreferredUseSecureBoot → PreferredEfi
-
-**Versions affected:** v1.4.0+ (deprecated), planned removal in v1beta2 or v1
-
-This is the clearest Part 4 analogue in KubeVirt. The field is not just
-removed — it is being **replaced with a structured alternative**:
+**Status:** Deprecated since v1.4.0, removal planned for v1beta2 or v1.
 
 ```go
 // staging/src/kubevirt.io/api/instancetype/v1beta1/types.go
@@ -82,29 +63,43 @@ DeprecatedPreferredUseSecureBoot *bool `json:"preferredUseSecureBoot,omitempty"`
 PreferredEfi *v1.EFI `json:"preferredEfi,omitempty"`
 ```
 
-The old fields are booleans (`preferredUseEfi: true`). The replacement is a
-structured object (`preferredEfi: {secureBoot: true}`).
+The old fields are booleans. The replacement is a structured object. If these
+deprecated fields are removed in any release between 1.9 and 1.11, the
+skip-level migration will prune `preferredUseEfi` and `preferredUseSecureBoot`
+without populating `preferredEfi`. VMs referencing affected preferences would
+silently lose their EFI boot configuration.
 
-**What happens when the deprecated fields are removed:**
+**This is the highest-risk item for the EUS jump.** Preference objects are
+standalone CRs — the application-level ControllerRevision conversion pattern
+does not apply to them. Only a conversion webhook could preserve this data
+during migration.
 
-Without a conversion webhook, the storage version migration will prune
-`preferredUseEfi` and `preferredUseSecureBoot` from etcd but will **not**
-populate `preferredEfi`. This is identical to the Part 4 demo:
-
-| | With conversion (hypothetical) | Without conversion (actual) |
+| | Incremental (with conversion) | Skip-level (no conversion) |
 |---|---|---|
-| `preferredUseEfi: true` | Converted to `preferredEfi: {secureBoot: false}` | Pruned |
-| `preferredUseSecureBoot: true` | Converted to `preferredEfi: {secureBoot: true}` | Pruned |
-| `preferredEfi` after migration | Populated | **Missing** |
-| **EFI boot configuration** | Preserved | **Lost** |
+| `preferredUseEfi: true` | → `preferredEfi: {secureBoot: false}` | Pruned |
+| `preferredUseSecureBoot: true` | → `preferredEfi: {secureBoot: true}` | Pruned |
+| **EFI boot config** | Preserved | **Lost** |
 
-VMs referencing affected preference objects would silently lose their EFI boot
-configuration. The VM would still boot — but potentially with BIOS instead of
-EFI, which could cause boot failures or security policy violations.
+### Deprecated PreferredCPUTopology Constants
 
-### 3. Snapshot Indications → SourceIndications
+**Status:** Deprecated since v1.4.0.
 
-**Versions affected:** current (deprecated, not yet removed)
+```go
+DeprecatedPreferCores   PreferredCPUTopology = "preferCores"
+DeprecatedPreferSockets PreferredCPUTopology = "preferSockets"
+DeprecatedPreferThreads PreferredCPUTopology = "preferThreads"
+DeprecatedPreferSpread  PreferredCPUTopology = "preferSpread"
+DeprecatedPreferAny     PreferredCPUTopology = "preferAny"
+```
+
+These are enum value renames (e.g., `preferCores` → `cores`). If the old
+values are removed from the CRD's OpenAPI validation, stored preference
+objects using them would fail validation on write. Lower risk than the EFI
+fields since these are value changes, not structural field removals.
+
+### Snapshot Indications → SourceIndications
+
+**Status:** Deprecated, not yet removed.
 
 ```go
 // staging/src/kubevirt.io/api/snapshot/v1beta1/types.go
@@ -115,49 +110,126 @@ Indications []Indication `json:"indications,omitempty"`
 SourceIndications []SourceIndication `json:"sourceIndications,omitempty"`
 ```
 
-The old field is a flat list of indication strings. The replacement is a
-structured list that pairs each indication with a description message.
+The old field is a flat string list. The replacement is a structured list
+pairing each indication with a description message. If `Indications` is
+removed between 1.9 and 1.11, existing snapshots would lose their indication
+data during migration — `SourceIndications` would not be populated.
 
-**When `Indications` is removed:** Snapshots that only have `Indications`
-populated (created before the introduction of `SourceIndications`) will have
-that field pruned. `SourceIndications` will not be populated because no
-conversion webhook exists to map the old values to the new structured format.
-Tooling or controllers that rely on `SourceIndications` will see an empty list.
+### Clone API v1alpha1
 
-### 4. Clone API v1alpha1 → v1beta1
+**Status:** v1alpha1 still served alongside v1beta1 (since v1.5.0).
 
-**Versions affected:** v1.5.0+ (v1beta1 introduced, v1alpha1 still served)
+If v1alpha1 is dropped in any release between 1.9 and 1.11, objects still
+stored as v1alpha1 in etcd would be served through v1beta1 with schema
+pruning. Currently the JSON schemas are field-identical, so this is low risk
+unless fields diverge.
 
-```go
-// pkg/virt-operator/resource/generate/components/crds.go
+### Pool API v1alpha1
 
-Versions: []extv1.CustomResourceDefinitionVersion{
-    {
-        Name:    "v1alpha1",
-        Served:  true,
-        Storage: false,
-    },
-    {
-        Name:    "v1beta1",
-        Served:  true,
-        Storage: true,
-    },
-},
+**Status:** v1alpha1 still served alongside v1beta1 (since v1.8.0).
+
+Same situation as clone — currently field-identical, low risk unless schemas
+diverge.
+
+## New Risks Identified on main (Targeting 1.9)
+
+Changes already merged to main since v1.8.0 that affect the 1.8 → 1.11 path:
+
+### Export API: v1alpha1 Removed, v1 Added
+
+Already landed on main:
+- `d0e650fc4d` — Add `export.kubevirt.io/v1` API group
+- `6ec644cce7` — Remove deprecated export v1alpha1 API
+
+The export CRD now has v1beta1 (deprecated, still served) and v1 (storage).
+The v1 and v1beta1 schemas have identical JSON field names, so this transition
+is safe — no data loss during migration.
+
+However, any objects still stored as v1alpha1 in etcd from before v1.8.0 would
+need to have been migrated before this change. If a user skips from a version
+where v1alpha1 was storage to 1.9+, those objects would be served through the
+v1 endpoint with schema pruning.
+
+### Backup API: Custom Condition → metav1.Condition
+
+Already landed on main:
+- `1b0909d8c1` — Replace custom `Condition` type with `metav1.Condition`
+
+The old custom type had a `lastProbeTime` field. The new `metav1.Condition`
+does not have `lastProbeTime` but adds `observedGeneration`. The shared fields
+(`type`, `status`, `lastTransitionTime`, `reason`, `message`) have identical
+JSON names.
+
+```diff
+- LastProbeTime metav1.Time `json:"lastProbeTime,omitempty"`    // old, will be pruned
++ ObservedGeneration int64 `json:"observedGeneration,omitempty"` // new, not populated
 ```
 
-Both versions are still served. The clone CRD notably has **no `Conversion`
-field at all** — not even an explicit `NoneConverter`.
+**Risk:** During migration, `lastProbeTime` will be pruned from stored backup
+conditions. This is a status field loss, not a spec field loss, so it's lower
+severity — but it means historical probe timing data is permanently gone after
+migration.
 
-**When v1alpha1 is eventually removed:** As with the instancetype case, clone
-objects still stored as v1alpha1 in etcd would continue to be served through
-the v1beta1 endpoint with schema pruning applied. Any fields present in
-v1alpha1 but absent from v1beta1 would be pruned on read, and permanently lost
-when the storage version migration rewrites them. Since there is no conversion
-webhook, fields cannot be transformed — only dropped.
+### Snapshot: PartialSnapshot Indication Added
 
-## The Application-Level Conversion Pattern
+- `745ca9a085` — Add `PartialSnapshot` indication for excluded snapshottable volumes
 
-KubeVirt uses a pattern that is distinct from conversion webhooks:
+This is additive (new enum value), not a removal. No risk.
+
+## Review Checklist for 1.9 – 1.11
+
+Each intermediate release (1.9, 1.10, 1.11) should be reviewed for:
+
+### CRD Schema Changes
+
+- [ ] Are any fields removed from CRD schemas?
+- [ ] Are any API versions removed from CRDs (`Served: false` or dropped)?
+- [ ] Are any API versions added with different field shapes?
+- [ ] Does the storage version change for any CRD?
+- [ ] Are any deprecated fields finally removed?
+- [ ] Are enum values removed from OpenAPI validation?
+
+### Conversion Safety
+
+- [ ] For each removed field: is it simply deleted, or is there a replacement?
+- [ ] For each replacement field: is there a conversion webhook or
+      application-level code that populates the new field from the old?
+- [ ] Does that conversion code run during storage version migration, or only
+      at runtime when virt-controller processes the object?
+- [ ] Are there standalone CRs (not embedded in ControllerRevisions) that
+      would be affected? These cannot rely on virt-controller's upgrade handler.
+
+### Skip-Level Compound Effects
+
+- [ ] What is the cumulative diff between the 1.8 CRD schemas and the 1.11
+      CRD schemas? All field removals across 1.9, 1.10, and 1.11 will be
+      applied in a single migration.
+- [ ] Are any conversion webhooks introduced in intermediate releases and
+      then removed before 1.11? (Part 4 scenario — currently not applicable
+      since KubeVirt uses `NoneConverter` throughout, but worth checking if
+      this changes.)
+- [ ] Is the ordering of virt-controller reconciliation vs storage version
+      migration guaranteed? If the migrator runs before virt-controller has
+      reconciled all objects, application-level conversion will not have
+      completed.
+
+### Specific Items to Track
+
+| Item | Risk | When to check | What to look for |
+|---|---|---|---|
+| `preferredUseEfi` / `preferredUseSecureBoot` removal | **High** | Each release 1.9–1.11 | Field removed from v1beta1 schema |
+| `Indications` removal from snapshot API | Medium | Each release 1.9–1.11 | Field removed from v1beta1 schema |
+| `PreferredCPUTopology` deprecated enum values | Medium | Each release 1.9–1.11 | Old values removed from OpenAPI validation |
+| Clone v1alpha1 removal | Medium | Each release 1.9–1.11 | Version removed from CRD |
+| Pool v1alpha1 removal | Medium | Each release 1.9–1.11 | Version removed from CRD |
+| Export v1beta1 removal | Low | Each release 1.9–1.11 | Version removed from CRD (schemas are identical) |
+| Backup `Condition` type change | Low | 1.9 (already on main) | `lastProbeTime` pruned on migration |
+| Any new conversion webhooks | Low | Each release 1.9–1.11 | `NoneConverter` changed to `Webhook` |
+
+## The Application-Level Conversion Gap
+
+KubeVirt's conversion architecture creates a gap that is specific to
+skip-level upgrades:
 
 ```
                   ┌─────────────┐
@@ -180,47 +252,26 @@ KubeVirt uses a pattern that is distinct from conversion webhooks:
      └─────────────────┘   └────────────────┘
 ```
 
-The Go conversion code in `pkg/instancetype/compatibility/` and
-`pkg/instancetype/upgrade/` can transform objects between API versions:
+The Go conversion code in `pkg/instancetype/compatibility/` can transform
+objects between API versions — but only when virt-controller reconciles a VM.
+The migrator goes through the API server, which can only prune. If the
+migrator runs before virt-controller has processed all objects, data that could
+have been converted is instead pruned.
 
-```go
-// pkg/instancetype/compatibility/compatibility.go
-decodedObj, err := runtime.Decode(
-    generatedscheme.Codecs.UniversalDeserializer(),
-    revision.Data.Raw,
-)
-```
+For standalone CRs (preferences, snapshots), virt-controller's upgrade handler
+does not apply at all. These objects can only be preserved during migration by
+a conversion webhook — which KubeVirt does not have.
 
-This uses the internal Go type scheme to convert old versions to v1beta1. But
-this conversion only runs when:
+## Recommendation
 
-1. virt-controller reconciles a VM that references instancetype/preference
-   ControllerRevisions
-2. The upgrade handler (`pkg/instancetype/upgrade/handler.go`) is called during
-   the VM sync loop
+Before the OCP 4.22 → 5.2 EUS upgrade path is certified, the cumulative CRD
+schema diff between KubeVirt 1.8 and 1.11 should be audited for any field that
+is both **(a)** removed from the schema and **(b)** has a replacement field
+that requires conversion logic to populate. Each such field is a data loss risk
+during skip-level migration.
 
-It does **not** run during storage version migration. The migrator uses the
-Kubernetes dynamic client and goes through the API server, which applies schema
-pruning — not Go-level conversion.
-
-## Key Concern
-
-The gap between application-level conversion and storage-level migration
-creates a window for data loss:
-
-1. **Before upgrade:** Objects stored as v1alpha1/v1alpha2 with old field shapes
-2. **During upgrade:** virt-controller reconciles VMs and converts
-   ControllerRevisions at runtime — but only for VMs it touches
-3. **Storage migration runs:** The migrator rewrites all objects through the API
-   server, pruning fields not in the new schema — regardless of whether
-   virt-controller has had a chance to convert them
-
-If step 3 runs before step 2 has completed for all objects, data is lost for
-the objects that virt-controller hasn't reached yet.
-
-For the `PreferredUseEfi` → `PreferredEfi` transition, this is especially
-concerning because preference objects are standalone CRs (not embedded in
-ControllerRevisions), so the application-level conversion pattern doesn't
-apply to them at all. When those deprecated fields are removed from the schema,
-the only thing that could preserve the data is a conversion webhook — which
-KubeVirt does not have.
+For the `PreferredUseEfi` → `PreferredEfi` transition specifically: if these
+deprecated fields are removed in any release within the 1.8 → 1.11 window,
+either a conversion webhook must be added, or virt-operator must ensure it
+populates `preferredEfi` from the deprecated fields before the storage version
+migration runs.

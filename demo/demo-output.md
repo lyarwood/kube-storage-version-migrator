@@ -27,9 +27,10 @@ static analysis of the KubeVirt project.
    upgrades, but a skip-level upgrade that bypasses the webhook loses the
    data entirely instead of converting it.
 
-5. **[KubeVirt Analysis](part5-kubevirt-analysis.md)** — Applies the
-   findings from Parts 1–4 to the KubeVirt project (v1.4.0 – v1.8.0).
-   KubeVirt uses `NoneConverter` for all CRDs and relies on application-level
-   Go conversion that does not run during storage version migration, creating
-   a gap where field restructuring (e.g. `PreferredUseEfi` → `PreferredEfi`)
-   will cause data loss when deprecated fields are removed.
+5. **[KubeVirt Analysis](part5-kubevirt-analysis.md)** — Risk analysis for
+   the OCP 4.22 → 5.2 EUS-to-EUS upgrade (KubeVirt 1.8 → 1.11). KubeVirt
+   uses `NoneConverter` for all CRDs and relies on application-level Go
+   conversion that does not run during storage version migration. Identifies
+   specific risks (`PreferredUseEfi`, snapshot `Indications`, backup
+   `Condition` type change) and provides a review checklist for releases
+   1.9–1.11.
